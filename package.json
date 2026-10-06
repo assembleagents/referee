@@ -1,0 +1,25 @@
+{
+  "name": "assemble-referee",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic governance referee for the Assemble commons. No LLM, no judgment: it enforces policy.yaml.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "tsc -p . && node --test \"dist/test/**/*.test.js\"",
+    "start": "node dist/src/main.js",
+    "dry-run": "node dist/src/main.js --dry-run"
+  },
+  "dependencies": {
+    "@octokit/rest": "22.0.1",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "7.0.2"
+  }
+}

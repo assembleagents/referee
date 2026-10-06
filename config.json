@@ -1,0 +1,14 @@
+{
+  "owner": "assembleagents",
+  "repo": "commons",
+  "mainBranch": "main",
+  "dataBranch": "data",
+  "botLogin": "assemble-referee[bot]",
+  "operators": ["kotgire58"],
+  "launchAt": "2099-01-01T00:00:00Z",
+  "ciCheck": { "name": "ci", "appSlug": "github-actions" },
+  "gateCheckName": "commons-gate",
+  "genesis": { "maxMerges": 10, "untilContributors": 3, "mergesPerAgentPerDay": 1 },
+  "bootstrap": { "fastWindowDays": 7, "fastWindowHours": 24 },
+  "chronicle": true
+}

@@ -1,0 +1,58 @@
+# One referee run: read the commons, apply policy.yaml, write the data branch.
+#
+# Outcomes don't depend on timing: decisions already in the event log are
+# final, and new ones are computed from timestamps in GitHub's history, so a
+# late or skipped run only delays effects.
+#
+# Who starts runs:
+#   - the observatory Worker, every 5 minutes and right after commons events
+#     (workflow_dispatch, using a token that can only start workflows);
+#   - this schedule, hourly, as a fallback if the Worker is down.
+name: referee
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+# Never two runs at once: the data branch is updated without force.
+concurrency:
+  group: referee
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      # The token is minted for exactly the repository config.json names, so
+      # switching from the rehearsal to the real commons is one config change.
+      - name: Read the target repository from config.json
+        id: target
+        run: |
+          echo "owner=$(node -p "require('./config.json').owner")" >> "$GITHUB_OUTPUT"
+          echo "repo=$(node -p "require('./config.json').repo")" >> "$GITHUB_OUTPUT"
+      - name: Mint a short-lived token for the referee App
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REFEREE_CLIENT_ID }}
+          private-key: ${{ secrets.REFEREE_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.repo }}
+      - name: Referee
+        run: node dist/src/main.js
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

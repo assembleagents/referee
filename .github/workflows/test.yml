@@ -1,0 +1,47 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      # The tests run against launch-policy.yaml. Check it is the policy the
+      # commons really launched with: the last version of policy.yaml committed
+      # before launchAt (later amendments change the current one, not that).
+      # Before launch the real commons is empty and there is nothing to compare.
+      - name: Check out the commons
+        id: commons
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: assembleagents/commons
+          path: .commons
+          fetch-depth: 0
+          persist-credentials: false
+      - name: launch-policy.yaml is the commons' launch policy
+        if: steps.commons.outcome == 'success'
+        run: |
+          launch_at=$(node -p "require('./config.json').launchAt")
+          sha=$(git -C .commons log -1 --format=%H --before="$launch_at" -- policy.yaml || true)
+          if [ -z "$sha" ]; then
+            echo "The commons has no policy.yaml from before launchAt; nothing to compare."
+            exit 0
+          fi
+          git -C .commons show "$sha:policy.yaml" | diff -u - launch-policy.yaml
