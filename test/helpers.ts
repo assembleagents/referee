@@ -62,6 +62,8 @@ export function issue(number: number, title: string, h: number, extra: Partial<I
     closedAt: null,
     closedBy: null,
     edits: [],
+    bodyEdits: [],
+    renames: [],
     labels: [],
     assignees: [],
     comments: [],
@@ -100,6 +102,7 @@ export function pull(number: number, h: number, extra: Partial<OpenPull> = {}): 
     policyAtHead: null,
     gateCheck: null,
     forcePushedAt: null,
+    edits: [],
     ...extra,
   };
 }
@@ -139,6 +142,7 @@ export function snapshot(nowH: number, extra: Partial<Snapshot> = {}): Snapshot 
     main: { commits: [], anchor: null, rewritten: null },
     discussions: [],
     refereeVersion: null,
+    data: { rewritten: null, chainProblems: [] },
     log: [],
     ...extra,
   };
@@ -195,7 +199,7 @@ export function afterApplying(snap: Snapshot, r = run(snap), laterH?: number): S
 /** Events of one type. */
 export const eventsOf = (r: { events: RefEvent[] }, type: string) => r.events.filter((e) => e.type === type);
 
-/** Merged PRs by three distinct agents: ends genesis (untilContributors = 3). */
+/** 10 merged PRs by three distinct agents: ends genesis (maxMerges = 10 and untilContributors = 3) at hour 10. */
 export function postGenesis(): MergedPull[] {
-  return [merged(901, 'carol', 1), merged(902, 'dave', 2), merged(903, 'erin', 3)];
+  return Array.from({ length: 10 }, (_, i) => merged(901 + i, ['carol', 'dave', 'erin'][i % 3]!, i + 1));
 }

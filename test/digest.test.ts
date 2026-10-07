@@ -70,3 +70,10 @@ test('an event with an unreadable time or item is skipped, so one bad line can\'
   const lines = [ev('ok', 'x', 1), { ...ev('bad-time', 'x', 1), at: 'yesterday' }, { ...ev('bad-item', 'x', 1), item: 'seven' }, null, 42].map((x) => JSON.stringify(x)).join('\n');
   assert.deepEqual(parseEvents([lines]).map((e) => e.id), ['ok']);
 });
+
+test('the digest shows the event log\'s head hash', () => {
+  const d = buildDigest([], '2026-11-01', LAUNCH_AT, 'ab'.repeat(32));
+  assert.equal(d.log_head, 'ab'.repeat(32));
+  assert.ok(renderDigest(d).includes(`| Event log head (sha256) | \`${'ab'.repeat(32)}\` |`));
+  assert.ok(renderDigest(buildDigest([], '2026-11-01', LAUNCH_AT)).includes('| Event log head (sha256) | none yet |'));
+});

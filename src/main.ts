@@ -10,9 +10,10 @@ import { loadConfig, type RefereeConfig } from './config.js';
 import { buildDigest, daysToDigest, planChronicle, renderDigest } from './digest.js';
 import { evaluate } from './engine.js';
 import { applyActions, ensureLabels } from './github/apply.js';
-import { DIGEST_INDEX, readStore, writeStore, type Store } from './github/datastore.js';
+import { appendEvents, detectDataRewrite, DIGEST_INDEX, readStore, startLog, writeStore, type Store } from './github/datastore.js';
 import { fetchSnapshot } from './github/fetch.js';
 import { EventLog } from './log.js';
+import { readMemory, writeMemory } from './memory.js';
 import { MAX_PULLS_PER_RUN } from './selection.js';
 import type { Action, Issue, RefEvent } from './types.js';
 
@@ -28,11 +29,11 @@ interface DigestPlan {
  * newest one. A day that gets a fact recorded late (after it was digested)
  * has its digest rewritten, so the digests never disagree with the event log.
  */
-function planDigests(cfg: RefereeConfig, store: Store, events: RefEvent[], issues: Issue[], now: Date, fresh: RefEvent[]): DigestPlan {
+function planDigests(cfg: RefereeConfig, store: Store, events: RefEvent[], issues: Issue[], now: Date, fresh: RefEvent[], logHead: string | null): DigestPlan {
   const files = new Map<string, string>();
   const days = daysToDigest(cfg.launchAt, now.getTime(), store.digestDays);
   const write = (day: string): string => {
-    const digest = buildDigest(events, day, cfg.launchAt);
+    const digest = buildDigest(events, day, cfg.launchAt, logHead);
     const markdown = renderDigest(digest);
     files.set(`digests/${day}.json`, `${JSON.stringify(digest, null, 2)}\n`);
     files.set(`digests/${day}.md`, `${markdown}\n`);
@@ -93,16 +94,24 @@ async function main(): Promise<void> {
   }
 
   const store = await readStore(gh, cfg);
+  const memoryDir = process.env.REFEREE_MEMORY_DIR ?? '.referee-memory';
+  const memory = readMemory(memoryDir);
+  const rewritten = await detectDataRewrite(gh, cfg, memory.dataHead, store.headSha);
+  if (rewritten) log(`the data branch was rewritten: ${rewritten.from} is no longer in its history`);
+  if (store.chain.problems.length) log(`the event log's hash chain is broken: ${store.chain.problems.join('; ')}`);
   const eventLog = new EventLog(store.events);
   const snapshot = await fetchSnapshot(gh, cfg, now, { log: eventLog, previousMainSha: previousMainSha(store), pullBudget }, log);
   snapshot.log = store.events;
   // GitHub Actions sets GITHUB_SHA to the referee commit being run, which puts the referee's own version on the record.
   snapshot.refereeVersion = process.env.GITHUB_SHA ?? null;
+  snapshot.data = { rewritten, chainProblems: store.chain.problems };
   const result = evaluate(snapshot, cfg);
   log(`${result.actions.length} action(s), ${result.events.length} new event(s)`);
 
   if (dryRun) {
-    const digests = planDigests(cfg, store, dedupe([...store.events, ...result.events]), snapshot.issues, now, result.events);
+    const pending = startLog(store);
+    appendEvents(pending, result.events, now.toISOString());
+    const digests = planDigests(cfg, store, dedupe([...store.events, ...result.events]), snapshot.issues, now, result.events, pending.head);
     console.log(JSON.stringify({ actions: result.actions, events: result.events, state: result.state, digests: [...digests.files.keys()], chronicle: digests.chronicle }, null, 2));
     return;
   }
@@ -113,7 +122,10 @@ async function main(): Promise<void> {
   // Digests are built from everything recorded so far, including this run.
   const allEvents = dedupe([...store.events, ...result.events, ...applied.events]);
   const fresh = [...result.events, ...applied.events].filter((e) => !store.eventIds.has(e.id));
-  const digests = planDigests(cfg, store, allEvents, snapshot.issues, now, fresh);
+  // Chain this run's events first, so the digests and the chronicle can show the log's head hash.
+  const pending = startLog(store);
+  appendEvents(pending, [...result.events, ...applied.events], now.toISOString());
+  const digests = planDigests(cfg, store, allEvents, snapshot.issues, now, fresh, pending.head);
   const extraEvents: RefEvent[] = [];
   let chronicleFailures = 0;
   if (digests.chronicle && digests.chronicle.actions.length) {
@@ -124,8 +136,10 @@ async function main(): Promise<void> {
     }
   }
 
-  const written = await writeStore(gh, cfg, store, [...result.events, ...applied.events, ...extraEvents], result.state, now.toISOString(), digests.files);
-  log(`applied ${applied.done}, failed ${applied.failed.length}; data branch ${written.committed ? `updated (+${written.newEvents} events)` : 'unchanged'}`);
+  appendEvents(pending, extraEvents, now.toISOString());
+  const written = await writeStore(gh, cfg, store, pending, result.state, digests.files);
+  if (written.headSha) writeMemory(memoryDir, { dataHead: written.headSha });
+  log(`applied ${applied.done}, failed ${applied.failed.length}; data branch ${written.committed ? `updated (+${written.newEvents} events, log head ${pending.head ?? 'none'})` : 'unchanged'}`);
 
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
   if (summaryPath) {

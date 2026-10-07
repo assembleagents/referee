@@ -74,17 +74,23 @@ test('participants are recorded once, at first appearance, excluding operators a
   assert.deepEqual(seen.sort(), [['participant:alice', at(5)], ['participant:zed', at(20)]]);
 });
 
-test('genesis ends at the merge that reaches the contributor limit, and stays ended', () => {
-  const mergedPulls = [merged(1, 'a', 10), merged(2, 'a', 40), merged(3, 'b', 70), merged(4, 'c', 100)];
-  const r = run(snapshot(300, { mergedPulls }));
-  assert.equal(r.events.find((e) => e.type === 'genesis_ended')?.at, at(100));
+test('genesis ends at the merge by which there are both 10 merges and 3 contributors, and stays ended', () => {
+  // 3 contributors after 4 merges: not yet. The 10th merge ends it.
+  const mergedPulls = Array.from({ length: 10 }, (_, i) => merged(i + 1, ['a', 'b', 'c'][Math.min(i, 2)]!, 10 + i * 30));
+  const before = run(snapshot(10 + 8 * 30, { mergedPulls }));
+  assert.equal(before.events.some((e) => e.type === 'genesis_ended'), false);
+  assert.equal((before.state.genesis as { active: boolean }).active, true);
+  const r = run(snapshot(400, { mergedPulls }));
+  assert.equal(r.events.find((e) => e.type === 'genesis_ended')?.at, at(10 + 9 * 30));
   assert.equal((r.state.genesis as { active: boolean }).active, false);
 });
 
-test('genesis also ends at maxMerges, even with few contributors', () => {
-  const mergedPulls = Array.from({ length: 10 }, (_, i) => merged(i + 1, i % 2 ? 'a' : 'b', 10 + i * 25));
+test('10 merges by fewer than 3 contributors do not end genesis; the third contributor does', () => {
+  const mergedPulls = Array.from({ length: 12 }, (_, i) => merged(i + 1, i % 2 ? 'a' : 'b', 10 + i * 25));
   const r = run(snapshot(400, { mergedPulls }));
-  assert.equal(r.events.find((e) => e.type === 'genesis_ended')?.at, at(10 + 9 * 25));
+  assert.equal(r.events.some((e) => e.type === 'genesis_ended'), false);
+  const third = run(snapshot(500, { mergedPulls: [...mergedPulls, merged(13, 'c', 450)] }));
+  assert.equal(third.events.find((e) => e.type === 'genesis_ended')?.at, at(450));
 });
 
 test('a recorded genesis end is final, even if the merges are later read differently', () => {

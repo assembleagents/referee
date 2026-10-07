@@ -80,6 +80,8 @@ export async function fetchSnapshot(gh: Octokit, cfg: RefereeConfig, now: Date, 
       closedAt: i.closed_at ?? null,
       closedBy: null,
       edits: [],
+      bodyEdits: [],
+      renames: [],
       labels: i.labels.map((l) => (typeof l === 'string' ? l : l.name ?? '')).filter(Boolean),
       assignees: (i.assignees ?? []).map((a) => a.login),
       comments: commentsByItem.get(i.number) ?? [],
@@ -118,10 +120,10 @@ export async function fetchSnapshot(gh: Octokit, cfg: RefereeConfig, now: Date, 
   }
   log(`open PRs: ${open.length}, inspected ${openPulls.length}${open.length > selected.length ? ` (budget ${opts.pullBudget}, round robin by author)` : ''}; new CI runs: ${ciRuns.length}`);
   try {
-    await fillForcePushes(gh, cfg, openPulls);
+    await fillPullHistory(gh, cfg, openPulls);
   } catch (e) {
-    // Without them the gate still has the CI runs; only a re-pushed old head is dated less tightly.
-    log(`could not read force-push times: ${(e as Error).message.split('\n')[0]}`);
+    // Without force-pushes the gate still has the CI runs; without the edit history (left null) it waits.
+    log(`could not read force-push and edit history: ${(e as Error).message.split('\n')[0]}`);
   }
 
   // 6. PRs merged since launch.
@@ -163,6 +165,7 @@ export async function fetchSnapshot(gh: Octokit, cfg: RefereeConfig, now: Date, 
     main,
     discussions,
     refereeVersion: null,
+    data: { rewritten: null, chainProblems: [] },
     log: [],
   };
 }
@@ -217,26 +220,57 @@ async function fetchDiscussions(gh: Octokit, cfg: RefereeConfig, now: Date): Pro
   return discussionPosts(res.repository?.discussions.nodes ?? [], now.getTime() - DISCUSSION_LOOKBACK_MS);
 }
 
-/** GraphQL is the only API with an issue's edit history (body edits and title renames). */
+/**
+ * GraphQL is the only API with an issue's edit history (body edits and title
+ * renames). Each body edit's `diff` is the full text of that version.
+ */
 async function fillEdits(gh: Octokit, cfg: RefereeConfig, issues: Issue[]): Promise<void> {
-  type Nodes<T> = { nodes: (T | null)[] | null } | null;
-  type Edits = { e1: Nodes<{ editedAt: string | null }>; e2: Nodes<{ editedAt: string | null }>; r1: Nodes<{ createdAt?: string }>; r2: Nodes<{ createdAt?: string }> };
   for (let i = 0; i < issues.length; i += 25) {
     const chunk = issues.slice(i, i + 25);
     const fields = chunk
       .map((x) => `i${x.number}: issue(number: ${x.number}) {
-        e1: userContentEdits(first: 100) { nodes { editedAt } }
-        e2: userContentEdits(last: 100) { nodes { editedAt } }
-        r1: timelineItems(itemTypes: [RENAMED_TITLE_EVENT], first: 100) { nodes { ... on RenamedTitleEvent { createdAt } } }
-        r2: timelineItems(itemTypes: [RENAMED_TITLE_EVENT], last: 100) { nodes { ... on RenamedTitleEvent { createdAt } } }
+        e1: userContentEdits(first: 100) { nodes { editedAt diff deletedAt } }
+        e2: userContentEdits(last: 100) { nodes { editedAt diff deletedAt } }
+        r1: timelineItems(itemTypes: [RENAMED_TITLE_EVENT], first: 100) { nodes { ... on RenamedTitleEvent { createdAt previousTitle currentTitle } } }
+        r2: timelineItems(itemTypes: [RENAMED_TITLE_EVENT], last: 100) { nodes { ... on RenamedTitleEvent { createdAt previousTitle currentTitle } } }
       }`)
       .join('\n');
-    const res = await gh.graphql<{ repository: Record<string, Edits | null> }>(
+    const res = await gh.graphql<{ repository: Record<string, RawEditHistory | null> }>(
       `query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { ${fields} } }`,
       { owner: cfg.owner, repo: cfg.repo },
     );
-    for (const x of chunk) x.edits = editTimes(res.repository[`i${x.number}`] ?? null);
+    for (const x of chunk) {
+      const h = res.repository[`i${x.number}`] ?? null;
+      x.edits = editTimes(h);
+      Object.assign(x, editVersions(h));
+    }
   }
+}
+
+type Conn<T> = { nodes?: (T | null)[] | null } | null | undefined;
+interface RawEditHistory {
+  e1?: Conn<{ editedAt?: string | null; diff?: string | null; deletedAt?: string | null }>;
+  e2?: Conn<{ editedAt?: string | null; diff?: string | null; deletedAt?: string | null }>;
+  r1?: Conn<{ createdAt?: string; previousTitle?: string; currentTitle?: string }>;
+  r2?: Conn<{ createdAt?: string; previousTitle?: string; currentTitle?: string }>;
+}
+
+/** The versions in an issue's GraphQL history, oldest first, each once. */
+export function editVersions(r: RawEditHistory | null): Pick<Issue, 'bodyEdits' | 'renames'> {
+  const bodies = new Map<string, string | null>();
+  const renames = new Map<string, { at: string; from: string; to: string }>();
+  for (const n of [...(r?.e1?.nodes ?? []), ...(r?.e2?.nodes ?? [])]) {
+    if (n?.editedAt) bodies.set(n.editedAt, n.deletedAt || typeof n.diff !== 'string' ? null : n.diff);
+  }
+  for (const n of [...(r?.r1?.nodes ?? []), ...(r?.r2?.nodes ?? [])]) {
+    if (n?.createdAt && typeof n.previousTitle === 'string' && typeof n.currentTitle === 'string') {
+      renames.set(`${n.createdAt}\n${n.previousTitle}`, { at: n.createdAt, from: n.previousTitle, to: n.currentTitle });
+    }
+  }
+  return {
+    bodyEdits: [...bodies].map(([at, body]) => ({ at, body })).sort((a, b) => a.at.localeCompare(b.at)),
+    renames: [...renames.values()].sort((a, b) => a.at.localeCompare(b.at)),
+  };
 }
 
 type ForcePushNode = { createdAt?: string; afterCommit?: { oid?: string } | null } | null;
@@ -248,18 +282,33 @@ export function latestForcePushTo(nodes: ForcePushNode[], sha: string): string |
   return best;
 }
 
-/** The PR timeline records every force-push with GitHub's time and the commit it moved the head to. */
-async function fillForcePushes(gh: Octokit, cfg: RefereeConfig, pulls: OpenPull[]): Promise<void> {
-  for (let i = 0; i < pulls.length; i += 50) {
-    const chunk = pulls.slice(i, i + 50);
+/**
+ * From each PR's timeline: every force-push, with GitHub's time and the commit
+ * it moved the head to, and every title rename. From its edit history: every
+ * description edit.
+ */
+async function fillPullHistory(gh: Octokit, cfg: RefereeConfig, pulls: OpenPull[]): Promise<void> {
+  type History = { f?: { nodes?: ForcePushNode[] | null } | null; e1?: unknown; e2?: unknown; r1?: unknown; r2?: unknown };
+  for (let i = 0; i < pulls.length; i += 25) {
+    const chunk = pulls.slice(i, i + 25);
     const fields = chunk
-      .map((p) => `p${p.number}: pullRequest(number: ${p.number}) { timelineItems(last: 5, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { nodes { ... on HeadRefForcePushedEvent { createdAt afterCommit { oid } } } } }`)
+      .map((p) => `p${p.number}: pullRequest(number: ${p.number}) {
+        f: timelineItems(last: 5, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { nodes { ... on HeadRefForcePushedEvent { createdAt afterCommit { oid } } } }
+        e1: userContentEdits(first: 100) { nodes { editedAt } }
+        e2: userContentEdits(last: 100) { nodes { editedAt } }
+        r1: timelineItems(itemTypes: [RENAMED_TITLE_EVENT], first: 100) { nodes { ... on RenamedTitleEvent { createdAt } } }
+        r2: timelineItems(itemTypes: [RENAMED_TITLE_EVENT], last: 100) { nodes { ... on RenamedTitleEvent { createdAt } } }
+      }`)
       .join('\n');
-    const res = await gh.graphql<{ repository: Record<string, { timelineItems?: { nodes?: ForcePushNode[] | null } | null } | null> }>(
+    const res = await gh.graphql<{ repository: Record<string, History | null> }>(
       `query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { ${fields} } }`,
       { owner: cfg.owner, repo: cfg.repo },
     );
-    for (const p of chunk) p.forcePushedAt = latestForcePushTo(res.repository[`p${p.number}`]?.timelineItems?.nodes ?? [], p.headSha);
+    for (const p of chunk) {
+      const h = res.repository[`p${p.number}`] ?? null;
+      p.forcePushedAt = latestForcePushTo(h?.f?.nodes ?? [], p.headSha);
+      p.edits = h ? editTimes(h) : null;
+    }
   }
 }
 
@@ -415,6 +464,7 @@ async function hydratePull(gh: Octokit, cfg: RefereeConfig, number: number, main
     policyAtHead,
     gateCheck,
     forcePushedAt: null,
+    edits: null,
   };
 }
 

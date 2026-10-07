@@ -290,3 +290,55 @@ test('a first-time contributor\'s CI run is approved by the referee, unless the 
   assert.equal(run(waiting({ author: 'founder' })).actions.some((a) => a.type === 'approve_run'), false);
   assert.equal(run(waiting({ headSha: 'moved-on' })).actions.some((a) => a.type === 'approve_run'), false);
 });
+
+test('a title or description edit starts a new revision: the window restarts from it', () => {
+  // Pushed at 200; description edited at 215: the window runs to 239, not 224.
+  const waiting = run(snapshot(230, { openPulls: [PR({ edits: [at(215)] })] }));
+  assert.equal(cond(waiting, 'window')?.verdict, 'wait');
+  assert.match(cond(waiting, 'window')!.detail, /from the latest title or description edit/);
+  assert.equal(view(waiting).window_ends_at, at(239));
+  assert.equal(merges(waiting.actions).length, 0);
+  assert.equal(merges(run(snapshot(239, { openPulls: [PR({ edits: [at(215)] })] })).actions).length, 1);
+  // An edit before the latest push changes nothing.
+  assert.equal(view(run(snapshot(230, { openPulls: [PR({ edits: [at(150)] })] }))).window_ends_at, at(224));
+});
+
+test('without the edit history the window waits', () => {
+  const r = run(snapshot(300, { openPulls: [PR({ edits: null })] }));
+  assert.equal(cond(r, 'window')?.verdict, 'wait');
+  assert.match(cond(r, 'window')!.detail, /edit history/);
+  assert.equal(merges(r.actions).length, 0);
+});
+
+test('approvals given before a title or description edit do not count', () => {
+  const base = { mergedPulls: postGenesis() };
+  const edits = [at(220)];
+  const old = run(snapshot(300, { ...base, openPulls: [PR({ edits, comments: [comment('carol', '/approve', 210)], reviews: [review('dave', 'APPROVED', 'head20', 210)] })] }));
+  assert.deepEqual(view(old).approvals, []);
+  assert.equal(cond(old, 'approvals')?.verdict, 'wait');
+  const fresh = run(snapshot(300, { ...base, openPulls: [PR({ edits, comments: [comment('carol', '/approve', 221)], reviews: [review('dave', 'APPROVED', 'head20', 221)] })] }));
+  assert.deepEqual(view(fresh).approvals, ['carol', 'dave']);
+});
+
+test('a review of head A does not count after A, B, then A again', () => {
+  const ciRuns = [push(20, 'head20', 200), push(20, 'yyy', 210), push(20, 'head20', 230)];
+  const base = { mergedPulls: postGenesis(), ciRuns };
+  const stale = run(snapshot(300, { ...base, openPulls: [PR({ reviews: [review('carol', 'APPROVED', 'head20', 205)] })] }));
+  assert.deepEqual(view(stale).approvals, []);
+  assert.equal(merges(stale.actions).length, 0);
+  // A review of A after it became the head again counts.
+  const again = run(snapshot(300, { ...base, openPulls: [PR({ reviews: [review('carol', 'APPROVED', 'head20', 205), review('carol', 'APPROVED', 'head20', 231)] })] }));
+  assert.deepEqual(view(again).approvals, ['carol']);
+  // An old CHANGES_REQUESTED doesn't cancel a later /approve either; only reviews of this revision count.
+  const oldVeto = run(snapshot(300, { ...base, openPulls: [PR({ reviews: [review('carol', 'CHANGES_REQUESTED', 'head20', 205)], comments: [comment('carol', '/approve', 240)] })] }));
+  assert.deepEqual(view(oldVeto).approvals, ['carol']);
+});
+
+test('a review given before the reviewer had standing does not count, even once they have it', () => {
+  // Zed approves at 230; Zed's first PR merges at 240. The review is judged at 230.
+  const mergedPulls = [...postGenesis(), merged(950, 'zed', 240)];
+  const r = run(snapshot(300, { mergedPulls, openPulls: [PR({ reviews: [review('zed', 'APPROVED', 'head20', 230)] })] }));
+  assert.deepEqual(view(r).approvals, []);
+  const later = run(snapshot(300, { mergedPulls, openPulls: [PR({ reviews: [review('zed', 'APPROVED', 'head20', 230), review('zed', 'APPROVED', 'head20', 241)] })] }));
+  assert.deepEqual(view(later).approvals, ['zed']);
+});

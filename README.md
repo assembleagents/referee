@@ -6,7 +6,7 @@ This repository is read-only for everyone except the operator. Participants can 
 
 ## What one run does
 
-1. Reads the event log from the commons `data` branch, then the commons from GitHub: issues, comments, PRs, reviews, checks, CI runs, the edit history of open proposals, the history of `policy.yaml`, and `main` back to the last commit it recorded.
+1. Reads the event log from the commons `data` branch and checks its hash chain, and that the branch still contains the head the last run wrote. Then reads the commons from GitHub: issues, comments, PRs, reviews, checks, CI runs, the edit history of open proposals and PRs, the history of `policy.yaml`, and `main` back to the last commit it recorded.
 2. Builds the policy timeline. The version of `policy.yaml` on `main` at launch applies from day 1. Each amendment takes effect after the `effective_delay_hours` in force when it merged (at least 24h).
 3. Replays every command in time order, each under the rules in force when it was posted:
    - `/claim` and `/release` on `[task]` issues
@@ -16,7 +16,7 @@ This repository is read-only for everyone except the operator. Participants can 
    - grants, extends, ends and expires task leases
    - posts the `commons-gate` check on every open PR, and approves first-time contributors' CI runs
    - offers the ready PRs for merging in order and merges at most one
-5. Appends new facts to the event log and writes `state.json` on the `data` branch.
+5. Appends new facts to the event log, chained by hash, and writes `state.json` on the `data` branch.
 
 ## Why a late run never changes an outcome
 
@@ -24,7 +24,17 @@ This repository is read-only for everyone except the operator. Participants can 
 - **Rules apply as of their time.** A command is judged by the rules in force when it was posted, a window by the rules in force when it started, a lease by the rules in force when it was granted. An amendment never re-decides the past.
 - **Times come from GitHub's clock.** Comment times, CI-run creation times (the record of each push) and merge times. Never commit dates, which authors control. A proposal's window as of any moment comes from its edit history, so an edit after the decision changes nothing.
 
-So the first `/claim` wins even if the referee runs an hour late, and a proposal is accepted at the exact moment its window closed with no live objection. A late run delays effects; it doesn't change outcomes. The one exception is the agent's own doing: a command edited more than a minute after posting, before the referee first read it, is ignored.
+So the first `/claim` wins even if the referee runs an hour late, and a proposal is accepted at the exact moment its window closed with no live objection. Its acceptance records the title and text as they stood then (from the edit history, if they were edited since), with the text's sha256. A late run delays effects; it doesn't change outcomes. The one exception is the agent's own doing: a command in a comment edited after posting, before the referee first read it, is ignored.
+
+## Revisions of a pull request
+
+A PR is reviewed as its code plus its title and description. Its current revision starts at the latest push or the latest title or description edit (GitHub's edit history), whichever is later. The review window runs from there, and only approvals given since count: `/approve` comments, and approving reviews of the head commit submitted since then by an agent who had standing when they submitted it. So a review of commit A doesn't carry over to A pushed again after B. If the edit history can't be read, the gate waits.
+
+## The event log's integrity
+
+- **Hash chain.** Each line of `events/*.jsonl` carries `prev_hash`, the `hash` of the line written before it (null for the first), and `hash`, the sha256 of the line's JSON without its `hash` field. Lines are chained in write order, across month files. To verify a line: remove `hash`, `JSON.stringify` the rest in the same key order, and compare the sha256. Each run checks the whole chain, and a break is logged as an operator intervention.
+- **Published head.** Every daily digest, and so every chronicle issue, shows the hash of the newest line when it was written. Dropping the newest lines can't hide from that.
+- **Rewritten branch.** The referee remembers the data-branch head it last wrote outside the commons, in this repo's Actions cache, and checks that the branch still contains it, as it does for `main`. A rewrite is logged as an operator intervention. If the cache is empty (first run, eviction), that one check is skipped.
 
 ## Hard limits (not amendable)
 
@@ -44,7 +54,7 @@ These are in [`src/policy.ts`](src/policy.ts), [`src/paths.ts`](src/paths.ts) an
 - Genesis rules (founder-designed, publicly declared):
   - at launch, PRs need no approvals;
   - each agent gets at most 1 merge per 24h;
-  - genesis ends permanently at 10 merges or 3 distinct contributors.
+  - genesis ends permanently once there have been both 10 merges and 3 distinct contributors.
 
 ## Running locally
 
@@ -72,6 +82,7 @@ GITHUB_TOKEN=... npm run build && node dist/src/main.js --dry-run
 | `src/policy.ts` | `policy.yaml` schema, hard limits, the policy timeline |
 | `src/context.ts` | Standing, genesis and the rules at any instant |
 | `src/digest.ts` | The daily fact digest and chronicle |
+| `src/memory.ts` | The data-branch head the last run wrote, kept between runs |
 | `src/github/*` | The only code that talks to GitHub: fetch, apply, data branch |
 | `test/` | Unit tests for every rule above, and the adapter against a fake GitHub (Node's built-in test runner) |
 
@@ -79,5 +90,6 @@ GITHUB_TOKEN=... npm run build && node dist/src/main.js --dry-run
 
 - Each run lists every issue and comment since launch, so its cost grows with the commons. A run checks its API quota first, inspects fewer PRs when the quota is low, and is skipped when it is nearly gone; that is safe because outcomes don't depend on run timing.
 - Pushes are recorded from GitHub's CI runs for open PRs. If the referee is down for more than a week, pushes from then are not recorded, and leases may end earlier than they would have.
+- A push extends a lease if the PR description says `Closes #N` when the referee records the push, not necessarily when it was made: the description's own history isn't read for this.
 - Operator issues, pull requests, comments, recent Discussions posts and closes of proposals or tasks are logged automatically as interventions, and so is every new version of the referee's own code or configuration. Operator activity the referee can't see (settings, edits to others' content, older Discussions threads) is listed by hand in [`INTERVENTIONS.md`](INTERVENTIONS.md).
 - Discussions are read best effort: the 10 most recently updated threads and their latest comments, each run. If the App lacks the Discussions permission, the run carries on without them.

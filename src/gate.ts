@@ -28,6 +28,8 @@ export interface GateResult {
   conditions: Condition[];
   /** When the current head was pushed (GitHub's clock), or null if no CI run for it exists yet. */
   pushedAt: number | null;
+  /** When the current revision began (push or title/description edit); the window and approvals count from here. */
+  revisedAt: number | null;
   windowEnd: number | null;
   approvers: string[];
   requiredApprovals: number;
@@ -60,6 +62,17 @@ export function headPushedAt(pr: OpenPull, pushes: Push[]): number | null {
   if (!last || last.sha !== pr.headSha) return null;
   const forced = pr.forcePushedAt ? ms(pr.forcePushedAt) : -Infinity;
   return Math.max(last.at, forced, ms(pr.createdAt));
+}
+
+/**
+ * When the current revision began: the head push, or the latest edit of the
+ * title or description, whichever is later. A PR is reviewed as code plus its
+ * title and description, so an edit is a new revision, like a push. Null while
+ * either is unknown.
+ */
+export function revisionAt(pr: OpenPull, pushedAt: number | null): number | null {
+  if (pushedAt === null || pr.edits === null) return null;
+  return Math.max(pushedAt, ...pr.edits.map(ms));
 }
 
 export interface GateInputs {
@@ -139,14 +152,18 @@ export function evaluateGate(pr: OpenPull, d: Deliberation, ctx: Context, inputs
     else add('up_to_date', 'pass', 'up to date with main');
   }
 
-  // 4. Has everyone had time to look? The window's length is the one in force when the head was pushed.
+  // 4. Has everyone had time to look? The window starts at the latest push or
+  // title/description edit, and its length is the one in force then.
+  const revisedAt = revisionAt(pr, pushedAt);
   let windowEnd: number | null = null;
   if (pushedAt === null) add('window', 'wait', 'the review window starts when CI starts on the latest push');
+  else if (revisedAt === null) add('window', 'wait', 'could not read the title and description edit history yet');
   else {
-    const atPush = ctx.policyAt(pushedAt);
-    const windowHours = amendment ? atPush.amendments.window_hours : atPush.pull_requests.window_hours;
-    windowEnd = pushedAt + windowHours * HOUR;
-    if (ctx.now < windowEnd) add('window', 'wait', `review window open until ${human(windowEnd)} (${windowHours}h from the latest push, ${human(pushedAt)})`);
+    const atRevision = ctx.policyAt(revisedAt);
+    const windowHours = amendment ? atRevision.amendments.window_hours : atRevision.pull_requests.window_hours;
+    windowEnd = revisedAt + windowHours * HOUR;
+    const from = revisedAt > pushedAt ? 'the latest title or description edit' : 'the latest push';
+    if (ctx.now < windowEnd) add('window', 'wait', `review window open until ${human(windowEnd)} (${windowHours}h from ${from}, ${human(revisedAt)})`);
     else add('window', 'pass', `review window closed ${human(windowEnd)}`);
   }
 
@@ -154,15 +171,15 @@ export function evaluateGate(pr: OpenPull, d: Deliberation, ctx: Context, inputs
   if (live.length) add('objections', 'wait', live.map((o) => `${o.objector}: ${code(o.reason, 140)}`).join('; '));
   else add('objections', 'pass', 'no live objections');
 
-  // 5. Approvals from eligible agents on this exact head, given after it was pushed.
-  const approvers = pushedAt === null ? [] : approversOnHead(pr, d, ctx, pushedAt);
+  // 5. Approvals from eligible agents on this exact head, given since the current revision began.
+  const approvers = revisedAt === null ? [] : approversOnHead(pr, d, ctx, revisedAt);
   const required = amendment
     ? rules.amendments.min_approvals
     : genesis
       ? 0
       : rules.pull_requests.min_approvals;
   if (approvers.length >= required) add('approvals', 'pass', `${approvers.length}/${required}${genesis && !amendment ? ' (genesis: none required)' : ''}`);
-  else add('approvals', 'wait', `${approvers.length}/${required} approvals on ${pr.headSha.slice(0, 7)} from eligible agents other than the author, given after the latest push`);
+  else add('approvals', 'wait', `${approvers.length}/${required} approvals on ${pr.headSha.slice(0, 7)} from eligible agents other than the author, given after the latest push or title/description edit`);
 
   // 6. Rules agents can switch on or off.
   // Talk before code: a change must implement a proposal participants accepted.
@@ -195,30 +212,36 @@ export function evaluateGate(pr: OpenPull, d: Deliberation, ctx: Context, inputs
   }
 
   const pass = c.every((x) => x.verdict === 'pass');
-  return { pass, kind, conditions: c, pushedAt, windowEnd, approvers, requiredApprovals: required, implements: implemented };
+  return { pass, kind, conditions: c, pushedAt, revisedAt, windowEnd, approvers, requiredApprovals: required, implements: implemented };
 }
 
 /**
  * Approvers: eligible agents (not the author) whose latest review on the head
- * commit is APPROVED, plus `/approve` comments posted after the head was pushed,
- * unless that agent's latest review on the head requests changes.
+ * commit since the revision began is APPROVED, plus `/approve` comments posted
+ * since then, unless that agent's latest such review requests changes.
+ *
+ * A review counts only if submitted at or after `revised`: the same commit can
+ * be the head again after another push (A, then B, then A), and a review from
+ * the first time doesn't carry over. Like an `/approve`, a review needs
+ * standing both when it was given and now.
  */
-export function approversOnHead(pr: OpenPull, d: Deliberation, ctx: Context, pushed: number): string[] {
+export function approversOnHead(pr: OpenPull, d: Deliberation, ctx: Context, revised: number): string[] {
   const author = pr.author.toLowerCase();
   const latest = new Map<string, { state: string; at: number; isBot: boolean }>();
   for (const r of pr.reviews) {
     if (r.commitId !== pr.headSha || r.state === 'COMMENTED' || r.state === 'PENDING') continue;
-    const who = r.author.toLowerCase();
     const at = ms(r.submittedAt);
+    if (at < revised) continue;
+    const who = r.author.toLowerCase();
     const prev = latest.get(who);
     if (!prev || at >= prev.at) latest.set(who, { state: r.state, at, isBot: r.authorIsBot });
   }
   const out = new Set<string>();
   for (const [who, r] of latest) {
-    if (who !== author && r.state === 'APPROVED' && ctx.eligibleAt(who, r.isBot, ctx.now)) out.add(who);
+    if (who !== author && r.state === 'APPROVED' && ctx.eligibleAt(who, r.isBot, r.at) && ctx.eligibleAt(who, r.isBot, ctx.now)) out.add(who);
   }
   for (const a of d.approvals) {
-    if (a.at < pushed || a.login === author || !ctx.eligibleAt(a.login, false, ctx.now)) continue;
+    if (a.at < revised || a.login === author || !ctx.eligibleAt(a.login, false, ctx.now)) continue;
     const review = latest.get(a.login);
     if (review && review.state === 'CHANGES_REQUESTED' && review.at > a.at) continue;
     out.add(a.login);

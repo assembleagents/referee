@@ -32,6 +32,8 @@ export interface Digest {
   prs_merged: (DigestItem & { amendment: boolean })[];
   leases_expired: DigestItem[];
   operator_interventions: number;
+  /** Hash of the newest event-log line when this digest was written (the log is a hash chain). */
+  log_head: string | null;
 }
 
 const dayOf = (isoTime: string) => isoTime.slice(0, 10);
@@ -47,7 +49,7 @@ export function daysToDigest(launchAt: string, now: number, existing: Set<string
   return days.slice(-MAX_BACKFILL_DAYS);
 }
 
-export function buildDigest(events: RefEvent[], day: string, launchAt: string): Digest {
+export function buildDigest(events: RefEvent[], day: string, launchAt: string, logHead: string | null = null): Digest {
   const today = events.filter((e) => dayOf(e.at) === day).sort((a, b) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id));
   const titles = new Map<number, string>();
   for (const e of events) {
@@ -68,7 +70,7 @@ export function buildDigest(events: RefEvent[], day: string, launchAt: string): 
     'lease_expired', 'lease_ended', 'objection_expired', 'proposal_accepted', 'proposal_lapsed', 'proposal_withdrawn', 'task_verified',
     'genesis_ended', 'policy_effective', 'policy_invalid_on_main', 'operator_intervention', 'operator_command_ignored', 'operator_activity', 'item_ignored',
     'pr_merged', 'merge_failed', 'ci_run_approved', 'main_red', 'main_anchor', 'main_rewritten', 'chronicle_opened',
-    'issue_closed', 'referee_version', 'referee_config', 'proposal_reopened',
+    'issue_closed', 'referee_version', 'referee_config', 'proposal_reopened', 'proposal_seen', 'data_rewritten', 'event_log_broken',
   ]);
   const active = [...new Set(today.filter((e) => e.actor && !derived.has(e.type)).map((e) => e.actor!.toLowerCase()))].sort();
 
@@ -89,6 +91,7 @@ export function buildDigest(events: RefEvent[], day: string, launchAt: string): 
       .map((e) => ({ item: e.item, title: e.item !== null ? titles.get(e.item) ?? null : null, actor: e.actor, amendment: e.data?.amendment === true })),
     leases_expired: pick('lease_expired'),
     operator_interventions: today.filter((e) => e.incident === 'operator_intervention').length,
+    log_head: logHead,
   };
 }
 
@@ -124,6 +127,7 @@ export function renderDigest(d: Digest): string {
     `| Commands rejected | ${n(d, 'command_rejected')} |`,
     `| Incidents | ${incidentText} |`,
     `| Operator interventions | ${d.operator_interventions} |`,
+    `| Event log head (sha256) | ${d.log_head ? `\`${d.log_head}\`` : 'none yet'} |`,
     ...section('Proposals opened', d.proposals_opened),
     ...section('Proposals accepted', d.proposals_accepted),
     ...section('Tasks opened', d.tasks_opened),

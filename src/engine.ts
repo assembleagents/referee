@@ -19,7 +19,7 @@ import { EventLog, type Push } from './log.js';
 import { commentKeys, Output } from './output.js';
 import { protectedHits } from './paths.js';
 import { buildPolicyTimeline, type PolicyTimeline } from './policy.js';
-import { evaluateProposal, PROPOSAL_PREFIX, TASK_PREFIX, windowStartAt, type ProposalResult, type ProposalStatus } from './proposals.js';
+import { contentAt, evaluateProposal, PROPOSAL_PREFIX, sha256, TASK_PREFIX, windowStartAt, type ProposalResult, type ProposalStatus } from './proposals.js';
 import { DAY, human, iso, ms } from './time.js';
 import type { Action, Comment, Issue, OpenPull, RefEvent, Snapshot } from './types.js';
 
@@ -91,6 +91,7 @@ export function evaluate(snap: Snapshot, cfg: RefereeConfig): Evaluation {
   approveFirstRuns(snap, gates, ctx, out);
 
   recordMain(snap, ctx, out);
+  recordData(snap, ctx, out);
 
   const state = buildState(snap, ctx, timeline, proposalResults, tasks, leases, gates);
   return { actions: out.actions, events: out.events, state };
@@ -189,7 +190,8 @@ function handleProposal(p: Issue, log: EventLog, ctx: Context, out: Output): Pro
       out.reply(p.number, 'accepted', result.how === 'early'
         ? `Accepted at ${decided}: enough eligible agents approved and no objection was live.`
         : `Accepted at ${decided}: the window closed with no live objection (lazy consensus).`, true);
-      out.event({ id: `proposal-accepted:${p.number}`, type: 'proposal_accepted', at: iso(result.decidedAt!), actor: null, item: p.number, data: { title: p.title, how: result.how, window_ends_at: iso(result.windowEnd) } });
+      // What was accepted, as it stood at that moment, so the record survives later edits.
+      out.event({ id: `proposal-accepted:${p.number}`, type: 'proposal_accepted', at: iso(result.decidedAt!), actor: null, item: p.number, data: { ...contentAt(p, result.decidedAt!), how: result.how, window_ends_at: iso(result.windowEnd) } });
       break;
     case 'lapsed':
       desiredLabels(out, p.number, p.labels, ['proposal', 'lapsed']);
@@ -203,9 +205,11 @@ function handleProposal(p: Issue, log: EventLog, ctx: Context, out: Output): Pro
       break;
     case 'contested':
       desiredLabels(out, p.number, p.labels, ['proposal', 'contested']);
+      recordSeen(p, ctx, out);
       break;
     default:
       desiredLabels(out, p.number, p.labels, ['proposal']);
+      recordSeen(p, ctx, out);
       out.reply(p.number, 'opened', `Proposal registered. Window: until ${human(result.windowEnd)}. It is accepted then unless an objection is live, or earlier with ${ctx.policyAt(result.windowStart).proposals.early_approvals} \`/approve\`s. Editing the title or text restarts the window.`);
   }
   // A decided proposal stays closed. Reopening it doesn't undo the decision.
@@ -222,6 +226,16 @@ function handleProposal(p: Issue, log: EventLog, ctx: Context, out: Output): Pro
     out.event({ id: `proposal-reopened:${p.number}:${p.closedAt}`, type: 'proposal_reopened', at: iso(ctx.now), actor: null, item: p.number, data: { closed_at: p.closedAt } });
   }
   return { issue: p, result, d };
+}
+
+/**
+ * The hash of an undecided proposal's description, each time the referee sees
+ * a new version of it: an edit (dated by its latest edit) or a new body.
+ */
+function recordSeen(p: Issue, ctx: Context, out: Output): void {
+  const hash = sha256(p.body);
+  const lastEdit = Math.max(ms(p.createdAt), ...p.edits.map(ms).filter((t) => t <= ctx.now));
+  out.event({ id: `proposal-seen:${p.number}:${iso(lastEdit)}:${hash.slice(0, 16)}`, type: 'proposal_seen', at: iso(ctx.now), actor: null, item: p.number, data: { title: p.title, body_sha256: hash, last_edit_at: iso(lastEdit) } });
 }
 
 /** Merge times of participants' PRs that closed each task, from the closing references frozen at merge. */
@@ -492,6 +506,21 @@ function recordMain(snap: Snapshot, ctx: Context, out: Output): void {
   }
 }
 
+/**
+ * Only the referee writes the data branch, and only by appending. A rewritten
+ * branch, or a broken hash chain in its event log, is an operator intervention.
+ */
+function recordData(snap: Snapshot, ctx: Context, out: Output): void {
+  const { rewritten, chainProblems } = snap.data;
+  if (rewritten) {
+    out.event({ id: `data-rewritten:${rewritten.from}:${rewritten.to ?? 'deleted'}`, type: 'data_rewritten', incident: 'operator_intervention', at: iso(ctx.now), actor: null, item: null, data: rewritten });
+  }
+  if (chainProblems.length) {
+    const key = sha256(chainProblems.join('\n')).slice(0, 16);
+    out.event({ id: `event-log-broken:${key}`, type: 'event_log_broken', incident: 'operator_intervention', at: iso(ctx.now), actor: null, item: null, data: { problems: chainProblems } });
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 function buildState(
@@ -564,6 +593,7 @@ function buildState(
       implements: gate.implements,
       head: pr.headSha,
       pushed_at: gate.pushedAt === null ? null : iso(gate.pushedAt),
+      revised_at: gate.revisedAt === null ? null : iso(gate.revisedAt),
       ready: gate.pass,
       window_ends_at: gate.windowEnd === null ? null : iso(gate.windowEnd),
       approvals: gate.approvers,

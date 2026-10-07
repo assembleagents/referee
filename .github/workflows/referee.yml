@@ -52,7 +52,22 @@ jobs:
           private-key: ${{ secrets.REFEREE_PRIVATE_KEY }}
           owner: ${{ steps.target.outputs.owner }}
           repositories: ${{ steps.target.outputs.repo }}
+      # The data branch head the last run wrote, kept outside the commons so a
+      # rewritten data branch is noticed (see src/memory.ts).
+      - name: Restore the referee's memory
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .referee-memory
+          key: referee-memory-${{ github.run_id }}
+          restore-keys: referee-memory-
       - name: Referee
         run: node dist/src/main.js
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          REFEREE_MEMORY_DIR: .referee-memory
+      - name: Save the referee's memory
+        if: always() && hashFiles('.referee-memory/memory.json') != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .referee-memory
+          key: referee-memory-${{ github.run_id }}-${{ github.run_attempt }}

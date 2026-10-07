@@ -108,7 +108,7 @@ export function computeGenesisEnd(merges: Merge[], g: RefereeConfig['genesis']):
   for (const m of merges) {
     count += 1;
     contributors.add(m.author);
-    if (count >= g.maxMerges || contributors.size >= g.untilContributors) return m.at;
+    if (count >= g.maxMerges && contributors.size >= g.untilContributors) return m.at;
   }
   return null;
 }

@@ -8,6 +8,7 @@
 //     at or before t, so an edit after the decision changes nothing;
 //   - each window's terms are the rules in force when it started.
 
+import { createHash } from 'node:crypto';
 import type { Context } from './context.js';
 import { isLive, objectionEnd, type Deliberation } from './deliberation.js';
 import { DAY, ms } from './time.js';
@@ -37,6 +38,34 @@ export function windowStartAt(p: Issue, t: number): number {
     if (at <= t && at > start) start = at;
   }
   return start;
+}
+
+export function sha256(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+export interface ProposalContent {
+  title: string;
+  /** Null if that version is no longer in GitHub's edit history. */
+  body: string | null;
+  body_sha256: string | null;
+  /** "current": nothing was edited since t. "history": read from the edit history. "unknown": the body at t can't be recovered. */
+  body_source: 'current' | 'history' | 'unknown';
+}
+
+/**
+ * The title and description as they stood at t. Edits after t (the referee
+ * can run late) are undone using the edit history: GitHub keeps each body
+ * version and each rename's old and new title.
+ */
+export function contentAt(p: Issue, t: number): ProposalContent {
+  const renameAfter = p.renames.find((r) => ms(r.at) > t);
+  const title = renameAfter ? renameAfter.from : p.title;
+  const editedAfter = p.bodyEdits.some((e) => ms(e.at) > t);
+  if (!editedAfter) return { title, body: p.body, body_sha256: sha256(p.body), body_source: 'current' };
+  const before = p.bodyEdits.filter((e) => ms(e.at) <= t).at(-1);
+  if (!before || before.body === null) return { title, body: null, body_sha256: null, body_source: 'unknown' };
+  return { title, body: before.body, body_sha256: sha256(before.body), body_source: 'history' };
 }
 
 export function lapseTime(p: Issue, ctx: Context): number {

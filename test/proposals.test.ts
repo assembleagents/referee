@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import type { Action } from '../src/types.js';
 import { afterApplying, at, comment, eventsOf, issue, LAUNCH_POLICY, merged, policyWith, postGenesis, run, snapshot } from './helpers.js';
@@ -201,13 +202,13 @@ test('rules apply as they stood at each command: a later amendment does not rewr
 });
 
 test('standing is judged under the rules in force at the command', () => {
-  // min_merged_prs goes from 1 to 2 at 300. Carol (one merge) objected at 260, before; Dave objects at 310, after.
+  // min_merged_prs goes from 1 to 2 at 300. Yan and Zed have one merge each: Yan objected at 260, before; Zed objects at 310, after.
   const stricter = policyWith((y) => y.replace('min_merged_prs: 1', 'min_merged_prs: 2'));
   const policyHistory = [{ sha: 'p1', committedAt: at(-1), raw: LAUNCH_POLICY }, { sha: 'p2', committedAt: at(276), raw: stricter }];
-  const issues = [P([comment('carol', '/object a', 260), comment('dave', '/object b', 310)])];
-  const r = run(snapshot(320, { issues, policyHistory, mergedPulls: postGenesis() }));
-  assert.ok(r.events.some((e) => e.type === 'objection_raised' && e.actor === 'carol'));
-  assert.ok(r.events.some((e) => e.type === 'command_rejected' && e.actor === 'dave'));
+  const issues = [P([comment('yan', '/object a', 260), comment('zed', '/object b', 310)])];
+  const r = run(snapshot(320, { issues, policyHistory, mergedPulls: [...postGenesis(), merged(950, 'yan', 20), merged(951, 'zed', 21)] }));
+  assert.ok(r.events.some((e) => e.type === 'objection_raised' && e.actor === 'yan'));
+  assert.ok(r.events.some((e) => e.type === 'command_rejected' && e.actor === 'zed'));
 });
 
 test('the author cannot object to their own proposal', () => {
@@ -250,4 +251,50 @@ test('an agent can re-approve after an edit and it counts', () => {
   ];
   const r = run(snapshot(254, { issues: [P(comments, { edits: [at(250)] })] }));
   assert.equal(accepted(r)?.at, at(253));
+});
+
+test('the acceptance records the title and text that were accepted, with the text\'s sha256', () => {
+  const r = run(snapshot(272, { issues: [P([], { body: 'Index every doc.' })] }));
+  const data = accepted(r)?.data;
+  assert.equal(data?.title, '[proposal] Build a shared knowledge index');
+  assert.equal(data?.body, 'Index every doc.');
+  assert.equal(data?.body_sha256, createHash('sha256').update('Index every doc.').digest('hex'));
+  assert.equal(data?.body_source, 'current');
+});
+
+test('a late run records the text as it stood at acceptance, from the edit history', () => {
+  // Accepted at 272. Then, before the referee runs at 310, the text is rewritten (280) and the title renamed (290).
+  const p = P([], {
+    title: '[proposal] Something else entirely',
+    body: 'v2',
+    edits: [at(280), at(290)],
+    bodyEdits: [{ at: at(200), body: 'v1' }, { at: at(280), body: 'v2' }],
+    renames: [{ at: at(290), from: '[proposal] Build a shared knowledge index', to: '[proposal] Something else entirely' }],
+  });
+  const data = accepted(run(snapshot(310, { issues: [p] })))?.data;
+  assert.equal(data?.title, '[proposal] Build a shared knowledge index');
+  assert.equal(data?.body, 'v1');
+  assert.equal(data?.body_sha256, createHash('sha256').update('v1').digest('hex'));
+  assert.equal(data?.body_source, 'history');
+  // If that version was deleted from the history, the record says the text is unknown rather than guessing.
+  const gone = { ...p, bodyEdits: [{ at: at(200), body: null }, { at: at(280), body: 'v2' }] };
+  const unknown = accepted(run(snapshot(310, { issues: [gone] })))?.data;
+  assert.equal(unknown?.body, null);
+  assert.equal(unknown?.body_sha256, null);
+  assert.equal(unknown?.body_source, 'unknown');
+});
+
+test('each version of an undecided proposal the referee sees is recorded by its hash, once', () => {
+  const first = run(snapshot(210, { issues: [P([], { body: 'v1' })] }));
+  const seen = eventsOf(first, 'proposal_seen');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]?.data?.body_sha256, createHash('sha256').update('v1').digest('hex'));
+  // Same version on the next run: nothing new.
+  assert.equal(eventsOf(run(snapshot(220, { issues: [P([], { body: 'v1' })], log: first.events })), 'proposal_seen').length, 0);
+  // Edited: a new record, even when an edit goes back to an earlier text.
+  const edited = run(snapshot(230, { issues: [P([], { body: 'v1', edits: [at(225)] })], log: first.events }));
+  assert.equal(eventsOf(edited, 'proposal_seen').length, 1);
+  assert.equal(eventsOf(edited, 'proposal_seen')[0]?.data?.last_edit_at, at(225));
+  // Decided proposals aren't recorded this way.
+  assert.equal(eventsOf(run(snapshot(300, { issues: [P()] })), 'proposal_seen').length, 0);
 });

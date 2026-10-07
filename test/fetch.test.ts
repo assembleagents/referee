@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Octokit } from '@octokit/rest';
 import { evaluate } from '../src/engine.js';
-import { fetchSnapshot } from '../src/github/fetch.js';
+import { editVersions, fetchSnapshot } from '../src/github/fetch.js';
 import { EventLog } from '../src/log.js';
 import type { RefEvent } from '../src/types.js';
 import { at, config, LAUNCH_POLICY } from './helpers.js';
@@ -97,9 +97,12 @@ function fakeGitHub() {
     },
     graphql: async (query: string) => {
       if (query.includes('HEAD_REF_FORCE_PUSHED_EVENT')) {
-        calls.push('graphql:force-pushes');
+        calls.push('graphql:pull-history');
         assert.match(query, /p3: pullRequest\(number: 3\)/);
-        return { repository: { p3: { timelineItems: { nodes: [{ createdAt: at(19), afterCommit: { oid: 'older' } }, { createdAt: at(22), afterCommit: { oid: 'h3' } }] } } } };
+        return { repository: { p3: {
+          f: { nodes: [{ createdAt: at(19), afterCommit: { oid: 'older' } }, { createdAt: at(22), afterCommit: { oid: 'h3' } }] },
+          e1: { nodes: [{ editedAt: at(23) }] }, e2: { nodes: [{ editedAt: at(23) }] }, r1: { nodes: [{ createdAt: at(21) }] }, r2: { nodes: [] },
+        } } };
       }
       if (query.includes('discussions(')) {
         calls.push('graphql:discussions');
@@ -142,6 +145,8 @@ test('fetchSnapshot reads the commons, isolates a failing PR, and the engine run
   assert.equal(snap.openPulls[0]?.checks[0]?.suiteId, 11);
   // The last force-push to the current head, from the PR timeline.
   assert.equal(snap.openPulls[0]?.forcePushedAt, at(22));
+  // Its title renames and description edits.
+  assert.deepEqual(snap.openPulls[0]?.edits, [at(21), at(23)]);
 
   // Only bob's own run is a push to #3; eve built the same commit from her fork.
   assert.deepEqual(snap.ciRuns.map((r) => [r.id, r.pull]), [[1, 3]]);
@@ -208,4 +213,16 @@ test('Discussions that can\'t be read are skipped, not fatal', async () => {
   const snap = await fetchSnapshot(broken, config(), new Date(at(40)), { log: new EventLog([]), previousMainSha: null, pullBudget: 60 }, (m) => lines.push(m));
   assert.deepEqual(snap.discussions, []);
   assert.ok(lines.some((l) => l.includes('could not read Discussions')));
+});
+
+test('editVersions reads each body version and rename once, oldest first; a deleted version is null', () => {
+  const v = editVersions({
+    e1: { nodes: [{ editedAt: at(3), diff: 'v2', deletedAt: null }, { editedAt: at(1), diff: 'v1', deletedAt: null }] },
+    e2: { nodes: [{ editedAt: at(3), diff: 'v2', deletedAt: null }, { editedAt: at(2), diff: null, deletedAt: at(4) }] },
+    r1: { nodes: [{ createdAt: at(5), previousTitle: 'a', currentTitle: 'b' }] },
+    r2: { nodes: [{ createdAt: at(5), previousTitle: 'a', currentTitle: 'b' }, null] },
+  });
+  assert.deepEqual(v.bodyEdits, [{ at: at(1), body: 'v1' }, { at: at(2), body: null }, { at: at(3), body: 'v2' }]);
+  assert.deepEqual(v.renames, [{ at: at(5), from: 'a', to: 'b' }]);
+  assert.deepEqual(editVersions(null), { bodyEdits: [], renames: [] });
 });

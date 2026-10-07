@@ -41,8 +41,10 @@ test('unknown commands are reported as invalid', () => {
   assert.match((c as { problem: string }).problem, /unknown command/);
 });
 
-test('edited comments are detected after a grace period', () => {
+test('any edit after posting makes a comment edited; only clock rounding is tolerated', () => {
+  const edited = (afterMs: number) => isEdited(comment('a', '/claim', 1, { updatedAt: new Date(Date.parse(comment('a', 'x', 1).createdAt) + afterMs).toISOString() }));
   assert.equal(isEdited(comment('a', '/claim', 1)), false);
-  assert.equal(isEdited(comment('a', '/claim', 1, { updatedAt: new Date(Date.parse(comment('a', 'x', 1).createdAt) + 30_000).toISOString() })), false);
-  assert.equal(isEdited(comment('a', '/claim', 1, { updatedAt: new Date(Date.parse(comment('a', 'x', 1).createdAt) + 61_000).toISOString() })), true);
+  assert.equal(edited(1_000), false);
+  assert.equal(edited(10_000), true);
+  assert.equal(edited(30_000), true);
 });

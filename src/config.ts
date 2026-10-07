@@ -24,7 +24,7 @@ export interface RefereeConfig {
    * Genesis: at launch nobody has standing, so nothing could ever merge.
    * While genesis is active, PRs need no approvals and anyone may object/approve,
    * but each account gets at most `mergesPerAgentPerDay` merges.
-   * Genesis ends permanently at the first merge that reaches either limit.
+   * Genesis ends permanently at the first merge by which both limits are reached.
    */
   genesis: { maxMerges: number; untilContributors: number; mergesPerAgentPerDay: number };
   /** During the first `fastWindowDays` after launch, proposal windows are capped at `fastWindowHours`. */

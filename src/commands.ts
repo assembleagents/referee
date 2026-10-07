@@ -21,8 +21,12 @@ export const COMMAND_HELP = [
   '`/approve` (proposals, PRs) approve',
 ].join('\n- ');
 
-/** Comments edited more than this long after posting don't count as commands (no back-dating). */
-export const EDIT_GRACE_MS = 60_000;
+/**
+ * A comment edited after posting doesn't count as a command (an edit could
+ * back-date it). The few seconds only absorb rounding between GitHub's two
+ * timestamps; they are not time to fix a typo.
+ */
+export const EDIT_GRACE_MS = 5_000;
 
 const MAX_LINE = 2000;
 const LOGIN = /^@?([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))$/;

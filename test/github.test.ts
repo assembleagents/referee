@@ -4,10 +4,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Octokit } from '@octokit/rest';
 import { applyActions } from '../src/github/apply.js';
-import { writeStore, type Store } from '../src/github/datastore.js';
+import { appendEvents, chainLine, checkChain, detectDataRewrite, lineHash, startLog, writeStore, type Store } from '../src/github/datastore.js';
 import { detectRewrite, editTimes, latestForcePushTo, mapRunsToPulls, walkMain, type RawRun, type WalkCommit } from '../src/github/fetch.js';
 import type { Action, RefEvent } from '../src/types.js';
-import { at, config, LAUNCH } from './helpers.js';
+import { at, config, LAUNCH, run, snapshot } from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // CI runs -> pushes
@@ -194,15 +194,20 @@ test('an approved CI run becomes an event; a failed approval does not', async ()
 // ---------------------------------------------------------------------------
 // The data branch
 
-const emptyStore = (over: Partial<Store> = {}): Store => ({ headSha: 'data0', files: new Map(), eventIds: new Set(), events: [], stateJson: null, digestDays: new Set(), ...over });
+const emptyStore = (over: Partial<Store> = {}): Store => ({ headSha: 'data0', files: new Map(), eventIds: new Set(), events: [], stateJson: null, digestDays: new Set(), chain: { head: null, problems: [] }, ...over });
+const pendingOf = (store: Store, events: RefEvent[], recordedAt: string) => {
+  const log = startLog(store);
+  appendEvents(log, events, recordedAt);
+  return log;
+};
 const ev = (id: string, h: number): RefEvent => ({ id, type: 't', at: at(h), actor: null, item: null });
 
 test('new events are appended to the file of the month they happened in; known ones are skipped', async () => {
   const { gh, calls } = fakeGh();
   const existing = `${JSON.stringify(ev('old', 1))}\n`;
   const store = emptyStore({ files: new Map([['events/2026-11.jsonl', existing]]), eventIds: new Set(['old']) });
-  const r = await writeStore(gh, config(), store, [ev('old', 1), ev('b', 2), ev('a', 2), ev('dec', 24 * 31)], { day: 1 }, at(800));
-  assert.deepEqual(r, { committed: true, newEvents: 3 });
+  const r = await writeStore(gh, config(), store, pendingOf(store, [ev('old', 1), ev('b', 2), ev('a', 2), ev('dec', 24 * 31)], at(800)), { day: 1 });
+  assert.deepEqual(r, { committed: true, newEvents: 3, headSha: 'commit1' });
   const blobs = calls.filter((c) => c.method === 'createBlob').map((c) => Buffer.from(String(c.args.content), 'base64').toString('utf8'));
   const nov = blobs.find((b) => b.startsWith(existing))!;
   assert.deepEqual(nov.trim().split('\n').map((l) => (JSON.parse(l) as RefEvent).id), ['old', 'a', 'b']);
@@ -213,7 +218,71 @@ test('new events are appended to the file of the month they happened in; known o
 test('a quiet run writes nothing: the timestamp alone is not a change', async () => {
   const { gh, calls } = fakeGh();
   const store = emptyStore({ stateJson: `${JSON.stringify({ schema: 1, generated_at: at(1), day: 1 }, null, 2)}\n` });
-  const r = await writeStore(gh, config(), store, [], { schema: 1, generated_at: at(2), day: 1 }, at(2));
-  assert.deepEqual(r, { committed: false, newEvents: 0 });
+  const r = await writeStore(gh, config(), store, pendingOf(store, [], at(2)), { schema: 1, generated_at: at(2), day: 1 });
+  assert.deepEqual(r, { committed: false, newEvents: 0, headSha: 'data0' });
   assert.deepEqual(calls, []);
+});
+
+// ---------------------------------------------------------------------------
+// The event log's hash chain
+
+const lines = (text: string) => text.trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>);
+
+test('each event line is chained to the one written before it, across month files and runs', () => {
+  const store = emptyStore();
+  const first = pendingOf(store, [ev('b', 2), ev('a', 2), ev('dec', 24 * 31)], at(800));
+  const nov = lines(first.files.get('events/2026-11.jsonl')!);
+  const dec = lines(first.files.get('events/2026-12.jsonl')!);
+  assert.deepEqual(nov.map((l) => l.id), ['a', 'b']);
+  assert.equal(nov[0]?.prev_hash, null);
+  assert.equal(nov[1]?.prev_hash, nov[0]?.hash);
+  assert.equal(dec[0]?.prev_hash, nov[1]?.hash);
+  assert.equal(first.head, dec[0]?.hash);
+  // The hash is the sha256 of the line without its hash field.
+  const { hash, ...rest } = nov[0]!;
+  assert.equal(lineHash(rest), hash);
+  // The stored files check out, and the next run continues from their head.
+  const files = new Map([...first.files]);
+  const check = checkChain(files.values());
+  assert.deepEqual(check, { head: first.head, problems: [] });
+  const next = pendingOf(emptyStore({ files, eventIds: new Set(['a', 'b', 'dec']), chain: check }), [ev('c', 3), ev('a', 2)], at(900));
+  assert.equal(next.added, 1);
+  assert.equal(lines(next.files.get('events/2026-11.jsonl')!).at(-1)?.prev_hash, first.head);
+});
+
+test('a changed, removed or forked line breaks the chain', () => {
+  const log = pendingOf(emptyStore(), [ev('a', 1), ev('b', 2), ev('c', 3)], at(800));
+  const text = log.files.get('events/2026-11.jsonl')!;
+  const [l1, l2, l3] = text.trim().split('\n');
+  assert.deepEqual(checkChain([text]).problems, []);
+  assert.match(checkChain([text.replace('"id":"b"', '"id":"B"')]).problems.join(), /don't match their hash/);
+  assert.match(checkChain([`${l1}\n${l3}\n`]).problems.join(), /missing/);
+  const fork = chainLine(ev('x', 3), at(801), JSON.parse(l2!).hash as string).line;
+  const forked = checkChain([`${text}${fork}\n`]);
+  assert.match(forked.problems.join(), /2 heads/);
+  assert.match(checkChain([`${text}{"id":"z","type":"t","at":"${at(4)}"}\n`]).problems.join(), /no hash/);
+  // A dropped newest line keeps the chain consistent: that is what the published head and the remembered data head catch.
+  assert.deepEqual(checkChain([`${l1}\n${l2}\n`]).problems, []);
+});
+
+test('a broken chain and a rewritten data branch are operator interventions, recorded once', async () => {
+  const r = run(snapshot(10, { data: { rewritten: { from: 'aaa', to: 'bbb' }, chainProblems: ['1 line(s) don\'t match their hash'] } }));
+  assert.equal(r.events.find((e) => e.type === 'data_rewritten')?.incident, 'operator_intervention');
+  assert.equal(r.events.find((e) => e.type === 'event_log_broken')?.incident, 'operator_intervention');
+  const again = run(snapshot(11, { data: { rewritten: null, chainProblems: ['1 line(s) don\'t match their hash'] }, log: r.events }));
+  assert.equal(again.events.some((e) => e.type === 'event_log_broken'), false);
+
+  const compare = (status: string | number) => ({
+    rest: { repos: { compareCommitsWithBasehead: async () => {
+      if (typeof status === 'number') throw Object.assign(new Error('gone'), { status });
+      return { data: { status } };
+    } } },
+  }) as unknown as Octokit;
+  assert.equal(await detectDataRewrite(compare('ahead'), config(), 'old', 'new'), null);
+  assert.equal(await detectDataRewrite(compare('identical'), config(), 'old', 'new'), null);
+  assert.equal(await detectDataRewrite(compare('ahead'), config(), null, 'new'), null);
+  assert.deepEqual(await detectDataRewrite(compare('behind'), config(), 'old', 'new'), { from: 'old', to: 'new' });
+  assert.deepEqual(await detectDataRewrite(compare('diverged'), config(), 'old', 'new'), { from: 'old', to: 'new' });
+  assert.deepEqual(await detectDataRewrite(compare(404), config(), 'old', 'new'), { from: 'old', to: 'new' });
+  assert.deepEqual(await detectDataRewrite(compare('ahead'), config(), 'old', null), { from: 'old', to: null });
 });

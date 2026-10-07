@@ -35,6 +35,13 @@ export interface Issue {
    * empty otherwise.
    */
   edits: ISODate[];
+  /**
+   * From the same edit history: the description as it stood after each edit
+   * (null where GitHub no longer shows that version), and every title rename.
+   * Used to record what a proposal said when it was accepted.
+   */
+  bodyEdits: { at: ISODate; body: string | null }[];
+  renames: { at: ISODate; from: string; to: string }[];
   labels: string[];
   assignees: string[];
   comments: Comment[];
@@ -118,6 +125,11 @@ export interface OpenPull {
    * a force-push, so this dates a re-pushed old head even before its CI run exists.
    */
   forcePushedAt: ISODate | null;
+  /**
+   * Every time the title was renamed or the description edited (GitHub's edit
+   * history, server time), or null if it couldn't be read: the gate then waits.
+   */
+  edits: ISODate[] | null;
 }
 
 /**
@@ -218,6 +230,13 @@ export interface Snapshot {
   discussions: DiscussionPost[];
   /** The referee's own code version (its repo's commit), so a change to it is on the record. */
   refereeVersion: string | null;
+  /** The data branch itself, as read this run. */
+  data: {
+    /** Set when the head the referee last wrote is no longer in the data branch's history. */
+    rewritten: { from: string; to: string | null } | null;
+    /** What is wrong with the event log's hash chain, if anything. */
+    chainProblems: string[];
+  };
   /** Every event already in the log. Facts recorded there are final. */
   log: RefEvent[];
 }
